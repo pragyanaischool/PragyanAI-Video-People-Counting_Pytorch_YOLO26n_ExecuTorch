@@ -4,36 +4,28 @@ import supervision as sv
 
 def create_tracker():
     """
-    Create a fresh ByteTrack instance for each video-processing job.
-
-    ByteTrack maintains object identities across consecutive frames,
-    allowing the system to track people even when they move.
+    Create a ByteTrack tracker for one video-processing job.
+    Compatible with supervision 0.30.9.
     """
-    return sv.ByteTrack()
+    return sv.ByteTrack(
+        track_activation_threshold=0.25,
+        lost_track_buffer=30,
+        minimum_matching_threshold=0.8,
+        frame_rate=30,
+    )
 
 
 def track_ultralytics_result(result, tracker):
     """
-    Convert Ultralytics YOLO detections into Supervision detections
-    and update the ByteTrack tracker.
-
-    Args:
-        result:
-            Ultralytics YOLO prediction result for a single frame.
-
-        tracker:
-            ByteTrack instance created using create_tracker().
-
-    Returns:
-        tuple:
-            detections: Original Supervision detections.
-            tracked: Detections with tracking IDs assigned by ByteTrack.
+    Convert YOLO detections into Supervision format
+    and assign tracking IDs using ByteTrack.
     """
 
-    # Convert YOLO result into Supervision Detections format
+    if result is None:
+        return sv.Detections.empty(), sv.Detections.empty()
+
     detections = sv.Detections.from_ultralytics(result)
 
-    # Update ByteTrack and assign tracking IDs
     tracked = tracker.update_with_detections(detections)
 
     return detections, tracked
