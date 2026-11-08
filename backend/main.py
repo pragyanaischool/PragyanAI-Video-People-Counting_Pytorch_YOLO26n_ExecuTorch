@@ -1,268 +1,267 @@
-
 """
-PragyanAI - People Detection & Counting API
+PragyanAI Video People Counting API
 
 Backend:
     FastAPI
-    YOLO11 TFLite
-    ByteTrack
+    YOLO26n ExecuTorch
     OpenCV
+    ByteTrack
 
-Features:
-    1. Backend health check
-    2. Model initialization
-    3. Video upload and validation
-    4. People detection and tracking
-    5. Processed video generation
-    6. CSV and JSON analytics
-    7. Output file management
+Frontend:
+    https://pragyan-yoloexecutorch.netlify.app
+
+Backend:
+    https://pragyanai-video-people-counting-pytorch.onrender.com
 """
 
-import os
-import json
-import uuid
 import logging
+import os
 import time
 
-from pathlib import Path
 from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import (
-    FastAPI,
-    UploadFile,
-    File,
-    Form,
-    HTTPException,
-)
-
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-
+from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from services.video_processor import VideoProcessor
+from config import settings
 
-from utils.video_utils import (
-    ALLOWED_EXTENSIONS,
-    VideoValidationError,
-    validate_video,
-)
+from routers.health import router as health_router
+from routers.jobs import router as jobs_router
+from routers.downloads import router as downloads_router
+
+from services.inference import get_model, model_info
 
 
-# =========================================================
+# ============================================================
 # 1. LOGGING
-# =========================================================
+# ============================================================
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format=(
-        "%(asctime)s | %(levelname)s | "
-        "%(name)s | %(message)s"
-    ),
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 
-logger = logging.getLogger("pragyanai")
+logger = logging.getLogger("pragyanai.api")
 
 
-# =========================================================
-# 2. PROJECT DIRECTORIES
-# =========================================================
+# ============================================================
+# 2. DEPLOYMENT URLS
+# ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent
-
-MODEL_PATH = Path(
-    os.getenv(
-        "MODEL_PATH",
-        str(BASE_DIR / "models" / "yolo11n.tflite"),
-    )
+FRONTEND_URL = (
+    "https://pragyan-yoloexecutorch.netlify.app"
 )
 
-if not MODEL_PATH.is_absolute():
-    MODEL_PATH = BASE_DIR / MODEL_PATH
-
-UPLOAD_DIR = Path(
-    os.getenv(
-        "UPLOAD_DIR",
-        "/tmp/pragyanai_uploads",
-    )
-)
-
-OUTPUT_DIR = Path(
-    os.getenv(
-        "OUTPUT_DIR",
-        "/tmp/pragyanai_outputs",
-    )
-)
-
-UPLOAD_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
-
-OUTPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
+BACKEND_URL = (
+    "https://pragyanai-video-people-counting-pytorch.onrender.com"
 )
 
 
-# =========================================================
-# 3. ENVIRONMENT CONFIGURATION
-# =========================================================
+# ============================================================
+# 3. CORS CONFIGURATION
+# ============================================================
 
-# Supports multiple frontend origins separated by commas.
-DEFAULT_FRONTENDS = (
-    "https://tflite-objectdetection-peopleanalysis.netlify.app,"
-    "https://pragyan-yoloexecutorch.netlify.app,"
-    "http://localhost:5173,"
-    "http://127.0.0.1:5173"
-)
-
-FRONTEND_ORIGINS = [
-    origin.strip().rstrip("/")
-    for origin in os.getenv(
-        "FRONTEND_ORIGIN",
-        DEFAULT_FRONTENDS,
-    ).split(",")
-    if origin.strip()
+DEFAULT_ORIGINS = [
+    FRONTEND_URL,
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
 ]
 
-PUBLIC_API_URL = os.getenv(
-    "PUBLIC_API_URL",
-    "https://pragyanai-yolo-tf-lite-object-detction.onrender.com",
-).rstrip("/")
+raw_origins = os.getenv("FRONTEND_ORIGIN", "")
 
-MAX_UPLOAD_SIZE = int(
-    os.getenv(
-        "MAX_UPLOAD_SIZE",
-        str(500 * 1024 * 1024),
-    )
-)
+if raw_origins.strip():
 
-CHUNK_SIZE = 1024 * 1024
+    allowed_origins = [
+        origin.strip().rstrip("/")
+        for origin in raw_origins.split(",")
+        if origin.strip()
+    ]
 
+else:
 
-# =========================================================
-# 4. APPLICATION STATE
-# =========================================================
-
-processor = None
-model_loaded = False
-model_error = None
+    allowed_origins = DEFAULT_ORIGINS
 
 
-# =========================================================
-# 5. MODEL INITIALIZATION
-# =========================================================
+# ============================================================
+# 4. APPLICATION LIFECYCLE
+# ============================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
-    global processor
-    global model_loaded
-    global model_error
+    logger.info("=" * 70)
 
-    startup_started = time.perf_counter()
+    logger.info(
+        "Starting PragyanAI YOLO26n ExecuTorch Backend"
+    )
 
-    logger.info("=" * 65)
-    logger.info("Starting PragyanAI People Detection Backend")
-    logger.info("=" * 65)
+    logger.info("=" * 70)
 
-    logger.info("Model path: %s", MODEL_PATH)
-    logger.info("Model exists: %s", MODEL_PATH.is_file())
-    logger.info("Upload directory: %s", UPLOAD_DIR)
-    logger.info("Output directory: %s", OUTPUT_DIR)
-    logger.info("Allowed frontend origins: %s", FRONTEND_ORIGINS)
+    logger.info(
+        "Backend URL: %s",
+        BACKEND_URL
+    )
+
+    logger.info(
+        "Frontend URL: %s",
+        FRONTEND_URL
+    )
+
+    logger.info(
+        "Model directory: %s",
+        settings.resolved_model_path
+    )
+
+    logger.info(
+        "Upload directory: %s",
+        settings.upload_path
+    )
+
+    logger.info(
+        "Output directory: %s",
+        settings.output_path
+    )
+
+    logger.info(
+        "Allowed origins: %s",
+        allowed_origins
+    )
+
+    # Create required directories
+
+    settings.upload_path.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    settings.output_path.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    app.state.model_ready = False
+    app.state.model_error = None
+
+    # --------------------------------------------------------
+    # LOAD YOLO26N EXECUTORCH MODEL
+    # --------------------------------------------------------
+
+    started = time.perf_counter()
 
     try:
 
-        if not MODEL_PATH.is_file():
-            raise FileNotFoundError(
-                f"YOLO model not found: {MODEL_PATH}"
-            )
-
-        logger.info("Loading YOLO11 TFLite model...")
-
-        model_started = time.perf_counter()
-
-        processor = await run_in_threadpool(
-            VideoProcessor,
-            str(MODEL_PATH),
+        logger.info(
+            "Loading YOLO26n ExecuTorch model..."
         )
 
-        model_loaded = True
-        model_error = None
+        await run_in_threadpool(get_model)
 
-        app.state.processor = processor
+        app.state.model_ready = True
+        app.state.model_error = None
 
         logger.info(
-            "Model loaded successfully in %.2f seconds",
-            time.perf_counter() - model_started,
+            "YOLO26n model loaded successfully"
         )
 
     except Exception as exc:
 
-        processor = None
-        model_loaded = False
-        model_error = str(exc)
-
-        app.state.processor = None
+        app.state.model_ready = False
+        app.state.model_error = str(exc)
 
         logger.exception(
-            "Model initialization failed"
+            "YOLO26n model initialization failed"
         )
 
+        # Keep API running so /health and /docs remain available.
+
+    elapsed = time.perf_counter() - started
+
     logger.info(
-        "Backend startup completed in %.2f seconds. Model loaded: %s",
-        time.perf_counter() - startup_started,
-        model_loaded,
+        "Model initialization completed in %.2f seconds",
+        elapsed
+    )
+
+    logger.info(
+        "Model ready: %s",
+        app.state.model_ready
     )
 
     yield
 
-    logger.info("Shutting down PragyanAI backend")
+    logger.info(
+        "Shutting down PragyanAI backend"
+    )
 
-    processor = None
-    model_loaded = False
 
-
-# =========================================================
-# 6. FASTAPI APPLICATION
-# =========================================================
+# ============================================================
+# 5. FASTAPI APPLICATION
+# ============================================================
 
 app = FastAPI(
-    title="PragyanAI People Detection & Counting API",
+
+    title="PragyanAI Video People Counting API",
+
     description=(
-        "YOLO11 TFLite based people detection, "
-        "ByteTrack tracking and video analytics."
+        "YOLO26n ExecuTorch based video object detection, "
+        "people counting, ByteTrack tracking and analytics."
     ),
-    version="1.0.0",
+
+    version="2.0.0",
+
+    docs_url="/docs",
+
+    redoc_url="/redoc",
+
+    openapi_url="/openapi.json",
+
     lifespan=lifespan,
 )
 
 
-# =========================================================
-# 7. CORS CONFIGURATION
-# =========================================================
+# ============================================================
+# 6. CORS MIDDLEWARE
+# ============================================================
 
 app.add_middleware(
+
     CORSMiddleware,
 
-    allow_origins=FRONTEND_ORIGINS,
+    allow_origins=allowed_origins,
 
     allow_credentials=False,
 
-    allow_methods=["*"],
+    allow_methods=[
+        "GET",
+        "POST",
+        "DELETE",
+        "OPTIONS",
+    ],
 
     allow_headers=["*"],
+
+    expose_headers=[
+        "Content-Disposition",
+        "Content-Length",
+    ],
+
+    max_age=600,
 )
 
 
-# =========================================================
-# 8. HTTP REQUEST LOGGING
-# =========================================================
+# ============================================================
+# 7. REQUEST LOGGING
+# ============================================================
 
 @app.middleware("http")
-async def request_logging_middleware(request, call_next):
+async def request_logging_middleware(
+    request: Request,
+    call_next
+):
 
     started = time.perf_counter()
 
@@ -274,9 +273,13 @@ async def request_logging_middleware(request, call_next):
 
         logger.info(
             "%s %s -> %s (%.3fs)",
+
             request.method,
+
             request.url.path,
+
             response.status_code,
+
             elapsed,
         )
 
@@ -286,578 +289,267 @@ async def request_logging_middleware(request, call_next):
 
         logger.exception(
             "Request failed: %s %s",
+
             request.method,
+
             request.url.path,
         )
 
         raise
 
 
-# =========================================================
-# 9. STATIC OUTPUT DIRECTORY
-# =========================================================
+# ============================================================
+# 8. REGISTER API ROUTERS
+# ============================================================
 
-app.mount(
-    "/outputs",
-    StaticFiles(directory=str(OUTPUT_DIR)),
-    name="outputs",
+# Health:
+# GET /health
+# GET /api/model-info
+
+app.include_router(
+    health_router
 )
 
 
-# =========================================================
-# 10. HELPER FUNCTIONS
-# =========================================================
+# Video processing:
+# POST /api/jobs
+# GET /api/jobs/{job_id}
+# GET /api/jobs/{job_id}/analytics
 
-def get_public_url(file_path):
-
-    filename = Path(file_path).name
-
-    return f"{PUBLIC_API_URL}/outputs/{filename}"
-
-
-def get_current_processor():
-
-    current_processor = getattr(
-        app.state,
-        "processor",
-        None,
-    )
-
-    if current_processor is None:
-
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "message": "YOLO model is not ready.",
-                "model_loaded": False,
-                "model_error": model_error,
-            },
-        )
-
-    return current_processor
+app.include_router(
+    jobs_router
+)
 
 
-def cleanup_file(file_path):
+# Downloads:
+# GET /api/jobs/{job_id}/video
+# GET /api/jobs/{job_id}/csv
+# GET /api/jobs/{job_id}/json
+# DELETE /api/jobs/{job_id}
 
-    if not file_path:
-        return
-
-    try:
-
-        path = Path(file_path)
-
-        if path.exists() and path.is_file():
-            path.unlink()
-
-    except Exception:
-
-        logger.exception(
-            "Unable to delete temporary file: %s",
-            file_path,
-        )
+app.include_router(
+    downloads_router
+)
 
 
-def safe_filename(filename):
+# ============================================================
+# 9. ROOT ENDPOINT
+# ============================================================
 
-    original_name = Path(
-        filename or "uploaded_video.mp4"
-    ).name
+@app.get("/", tags=["system"])
+async def root() -> dict[str, Any]:
 
-    extension = Path(
-        original_name
-    ).suffix.lower()
-
-    return f"{uuid.uuid4().hex}{extension}"
-
-
-# =========================================================
-# 11. ROOT ENDPOINT
-# =========================================================
-
-@app.get("/")
-async def root():
+    info = model_info()
 
     return {
-        "application": "PragyanAI People Detection & Counting",
+
+        "service": (
+            "PragyanAI Video People Counting API"
+        ),
+
         "status": "running",
-        "version": "1.0.0",
-        "backend": "FastAPI",
-        "detection_engine": "YOLO11 TFLite",
-        "tracking_engine": "ByteTrack",
-        "video_processing": "OpenCV",
-        "model_loaded": model_loaded,
-        "model_error": model_error,
+
+        "backend_url": BACKEND_URL,
+
+        "frontend_url": FRONTEND_URL,
+
+        "model": info.get(
+            "model",
+            "YOLO26n"
+        ),
+
+        "format": info.get(
+            "format",
+            "ExecuTorch"
+        ),
+
+        "model_files_present": info.get(
+            "model_files_present",
+            False
+        ),
+
+        "model_loaded": info.get(
+            "loaded",
+            False
+        ),
+
         "docs": "/docs",
+
         "health": "/health",
+
+        "model_info": "/api/model-info",
+
+        "create_job": "POST /api/jobs",
+
+        "job_status": "GET /api/jobs/{job_id}",
+
+        "job_analytics": (
+            "GET /api/jobs/{job_id}/analytics"
+        ),
+
+        "download_video": (
+            "GET /api/jobs/{job_id}/video"
+        ),
+
+        "download_csv": (
+            "GET /api/jobs/{job_id}/csv"
+        ),
+
+        "download_json": (
+            "GET /api/jobs/{job_id}/json"
+        ),
     }
 
 
-# =========================================================
-# 12. HEALTH CHECK
-# =========================================================
+# ============================================================
+# 10. API INFORMATION
+# ============================================================
 
-@app.get("/health")
-async def health_check():
-
-    return {
-        "success": True,
-        "status": (
-            "healthy"
-            if model_loaded
-            else "degraded"
-        ),
-        "api": "running",
-        "backend_connected": True,
-        "model_loaded": model_loaded,
-        "model_status": (
-            "ready"
-            if model_loaded
-            else "not_ready"
-        ),
-        "model_name": "YOLO11 TFLite",
-        "model_exists": MODEL_PATH.is_file(),
-        "model_path": str(MODEL_PATH),
-        "model_error": model_error,
-        "tracking_engine": "ByteTrack",
-        "video_processing": "OpenCV",
-    }
-
-
-# =========================================================
-# 13. MODEL INFORMATION
-# =========================================================
-
-@app.get("/api/model-info")
-async def model_info():
-
-    return {
-        "success": True,
-        "model_name": "YOLO11n TFLite",
-        "model_type": "Object Detection",
-        "model_format": "TensorFlow Lite",
-        "model_exists": MODEL_PATH.is_file(),
-        "model_loaded": model_loaded,
-        "model_status": (
-            "ready"
-            if model_loaded
-            else "not_ready"
-        ),
-        "model_error": model_error,
-        "classes": ["person"],
-        "class_ids": [0],
-        "tracking_engine": "ByteTrack",
-        "video_processing": "OpenCV",
-    }
-
-
-# =========================================================
-# 14. API INFORMATION
-# =========================================================
-
-@app.get("/api")
+@app.get("/api", tags=["system"])
 async def api_root():
 
     return {
-        "success": True,
-        "message": "PragyanAI People Detection API",
-        "available_endpoints": [
-            "/",
-            "/health",
-            "/api/model-info",
-            "/api/process",
-            "/api/outputs",
-            "/outputs/{filename}",
+
+        "message": (
+            "PragyanAI YOLO26n ExecuTorch API"
+        ),
+
+        "docs": "/docs",
+
+        "health": "/health",
+
+        "endpoints": [
+
+            "GET /health",
+
+            "GET /api/health",
+
+            "GET /api/model-info",
+
+            "POST /api/jobs",
+
+            "GET /api/jobs/{job_id}",
+
+            "GET /api/jobs/{job_id}/analytics",
+
+            "GET /api/jobs/{job_id}/video",
+
+            "GET /api/jobs/{job_id}/csv",
+
+            "GET /api/jobs/{job_id}/json",
+
+            "DELETE /api/jobs/{job_id}",
         ],
     }
 
 
-# =========================================================
-# 15. VIDEO PROCESSING ENDPOINT
-# =========================================================
+# ============================================================
+# 11. FRONTEND HEALTH-CHECK COMPATIBILITY
+# ============================================================
 
-@app.post("/api/process")
-async def process_video(
-    file: UploadFile = File(...),
-    confidence: float = Form(0.35),
-    frame_interval: int = Form(1),
-):
+# Your current frontend api.js calls /api/health.
+# The health router exposes /health.
+# This endpoint provides the required compatibility alias.
 
-    request_started = time.perf_counter()
+@app.get("/api/health", tags=["health"])
+async def api_health_alias():
 
-    input_path = None
-    job_id = uuid.uuid4().hex
+    info = model_info()
 
-    logger.info(
-        "Video processing request received: %s",
-        file.filename,
+    ready = bool(
+        info.get("loaded")
     )
 
-    try:
-
-        # ---------------------------------------------
-        # A. CHECK MODEL
-        # ---------------------------------------------
-
-        current_processor = get_current_processor()
-
-        # ---------------------------------------------
-        # B. VALIDATE PARAMETERS
-        # ---------------------------------------------
-
-        if not 0 <= confidence <= 1:
-
-            raise HTTPException(
-                status_code=400,
-                detail="Confidence must be between 0 and 1.",
-            )
-
-        if frame_interval < 1:
-
-            raise HTTPException(
-                status_code=400,
-                detail="Frame interval must be at least 1.",
-            )
-
-        # ---------------------------------------------
-        # C. VALIDATE FILE EXTENSION
-        # ---------------------------------------------
-
-        original_filename = (
-            file.filename or "uploaded_video.mp4"
-        )
-
-        extension = Path(
-            original_filename
-        ).suffix.lower()
-
-        if extension not in ALLOWED_EXTENSIONS:
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Unsupported video format. "
-                    "Supported formats: MP4, AVI, MOV, MKV, WEBM."
-                ),
-            )
-
-        # ---------------------------------------------
-        # D. GENERATE FILE PATHS
-        # ---------------------------------------------
-
-        input_filename = safe_filename(
-            original_filename
-        )
-
-        input_path = UPLOAD_DIR / input_filename
-
-        output_path = OUTPUT_DIR / f"{job_id}_processed.mp4"
-
-        csv_path = OUTPUT_DIR / f"{job_id}_analytics.csv"
-
-        json_path = OUTPUT_DIR / f"{job_id}_analytics.json"
-
-        # ---------------------------------------------
-        # E. SAVE UPLOADED VIDEO
-        # ---------------------------------------------
-
-        uploaded_size = 0
-
-        with open(input_path, "wb") as destination:
-
-            while True:
-
-                chunk = await file.read(CHUNK_SIZE)
-
-                if not chunk:
-                    break
-
-                uploaded_size += len(chunk)
-
-                if uploaded_size > MAX_UPLOAD_SIZE:
-
-                    raise HTTPException(
-                        status_code=413,
-                        detail="Video exceeds the maximum upload size.",
-                    )
-
-                destination.write(chunk)
-
-        if uploaded_size == 0:
-
-            raise HTTPException(
-                status_code=400,
-                detail="Uploaded video is empty.",
-            )
-
-        logger.info(
-            "Video uploaded: %.2f MB",
-            uploaded_size / (1024 * 1024),
-        )
-
-        # ---------------------------------------------
-        # F. VALIDATE VIDEO
-        # ---------------------------------------------
-
-        try:
-
-            video_info = await run_in_threadpool(
-                validate_video,
-                str(input_path),
-            )
-
-        except VideoValidationError as exc:
-
-            raise HTTPException(
-                status_code=400,
-                detail=str(exc),
-            )
-
-        # ---------------------------------------------
-        # G. PROCESS VIDEO
-        # ---------------------------------------------
-
-        logger.info(
-            "Starting YOLO inference and ByteTrack tracking"
-        )
-
-        analytics_result = await run_in_threadpool(
-            current_processor.process,
-            str(input_path),
-            str(output_path),
-            confidence,
-            frame_interval,
-            str(csv_path),
-        )
-
-        # ---------------------------------------------
-        # H. VERIFY OUTPUT
-        # ---------------------------------------------
-
-        if not output_path.is_file():
-
-            raise RuntimeError(
-                "Video processor did not generate output video."
-            )
-
-        if output_path.stat().st_size == 0:
-
-            raise RuntimeError(
-                "Generated output video is empty."
-            )
-
-        # ---------------------------------------------
-        # I. PREPARE ANALYTICS JSON
-        # ---------------------------------------------
-
-        if not isinstance(analytics_result, dict):
-
-            analytics_result = {
-                "result": analytics_result
-            }
-
-        analytics_result["job_id"] = job_id
-
-        analytics_result["video_info"] = video_info
-
-        analytics_result["processing_settings"] = {
-            "confidence": confidence,
-            "frame_interval": frame_interval,
-            "model": "YOLO11 TFLite",
-            "tracker": "ByteTrack",
-        }
-
-        with open(
-            json_path,
-            "w",
-            encoding="utf-8",
-        ) as json_file:
-
-            json.dump(
-                analytics_result,
-                json_file,
-                indent=4,
-                default=str,
-            )
-
-        # ---------------------------------------------
-        # J. GENERATE OUTPUT URLS
-        # ---------------------------------------------
-
-        video_url = get_public_url(output_path)
-
-        csv_url = (
-            get_public_url(csv_path)
-            if csv_path.is_file()
-            else None
-        )
-
-        json_url = get_public_url(json_path)
-
-        # ---------------------------------------------
-        # K. BUILD RESPONSE
-        # ---------------------------------------------
-
-        response = {
-            "success": True,
-
-            "message": (
-                "People detection and tracking completed successfully."
-            ),
-
-            "job_id": job_id,
-
-            "video_url": video_url,
-
-            "csv_url": csv_url,
-
-            "json_url": json_url,
-
-            "analytics": analytics_result,
-
-            "summary": analytics_result,
-
-            "video_info": video_info,
-
-            "processing_settings": {
-                "confidence": confidence,
-                "frame_interval": frame_interval,
-                "detection_engine": "YOLO11 TFLite",
-                "tracking_engine": "ByteTrack",
-            },
-
-            "processing_time_seconds": round(
-                time.perf_counter() - request_started,
-                2,
-            ),
-        }
-
-        logger.info(
-            "Processing completed successfully. Job ID: %s",
-            job_id,
-        )
-
-        return response
-
-    except HTTPException:
-
-        raise
-
-    except VideoValidationError as exc:
-
-        logger.exception("Video validation failed")
-
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Video processing failed. Job ID: %s",
-            job_id,
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "message": "Video processing failed.",
-                "error": str(exc),
-            },
-        )
-
-    finally:
-
-        cleanup_file(input_path)
-
-        try:
-            await file.close()
-        except Exception:
-            logger.exception("Unable to close uploaded file")
-
-
-# =========================================================
-# 16. LIST GENERATED OUTPUT FILES
-# =========================================================
-
-@app.get("/api/outputs")
-async def list_outputs():
-
-    files = []
-
-    for path in OUTPUT_DIR.iterdir():
-
-        if path.is_file():
-
-            files.append({
-                "filename": path.name,
-                "size_bytes": path.stat().st_size,
-                "url": get_public_url(path),
-            })
-
     return {
-        "success": True,
-        "total_files": len(files),
-        "files": files,
+
+        "status": (
+            "healthy"
+            if ready
+            else "degraded"
+        ),
+
+        "backend_connected": True,
+
+        "model_loaded": ready,
+
+        "model_files_present": info.get(
+            "model_files_present",
+            False
+        ),
+
+        "model": info.get(
+            "model",
+            "YOLO26n"
+        ),
+
+        "format": info.get(
+            "format",
+            "ExecuTorch"
+        ),
+
+        "model_path": info.get(
+            "model_path"
+        ),
+
+        "runtime": info.get(
+            "runtime"
+        ),
+
+        "model_error": getattr(
+            app.state,
+            "model_error",
+            None
+        ),
     }
 
 
-# =========================================================
-# 17. DELETE GENERATED OUTPUT
-# =========================================================
+# ============================================================
+# 12. GLOBAL ERROR HANDLER
+# ============================================================
 
-@app.delete("/api/outputs/{filename}")
-async def delete_output(filename: str):
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(
+    request: Request,
+    exc: Exception
+):
 
-    safe_name = Path(filename).name
+    logger.exception(
+        "Unhandled application exception: %s",
+        request.url.path
+    )
 
-    if safe_name != filename:
+    return JSONResponse(
 
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid filename.",
-        )
+        status_code=500,
 
-    target_path = OUTPUT_DIR / safe_name
+        content={
 
-    if not target_path.is_file():
+            "detail": (
+                "An unexpected backend error occurred."
+            ),
 
-        raise HTTPException(
-            status_code=404,
-            detail="Output file not found.",
-        )
-
-    try:
-
-        target_path.unlink()
-
-        return {
-            "success": True,
-            "message": "Output file deleted.",
-            "filename": safe_name,
+            "path": request.url.path,
         }
-
-    except Exception as exc:
-
-        logger.exception("Unable to delete output file")
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        )
+    )
 
 
-# =========================================================
-# 18. LOCAL DEVELOPMENT
-# =========================================================
+# ============================================================
+# 13. LOCAL DEVELOPMENT
+# ============================================================
 
 if __name__ == "__main__":
 
     import uvicorn
 
     uvicorn.run(
+
         "main:app",
+
         host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
-        reload=True,
+
+        port=int(
+            os.getenv("PORT", "8000")
+        ),
+
+        reload=False,
     )
