@@ -334,6 +334,55 @@ def _safe_progress_update(
         )
 
 
+def _serialize_detections(
+    detections: Any,
+    names: Any,
+) -> list[dict[str, Any]]:
+    """Convert Supervision detections to compact JSON-safe frame telemetry."""
+    if detections is None:
+        return []
+
+    boxes = getattr(detections, "xyxy", None)
+    class_ids = getattr(detections, "class_id", None)
+    tracker_ids = getattr(detections, "tracker_id", None)
+    confidences = getattr(detections, "confidence", None)
+
+    if boxes is None:
+        return []
+
+    output: list[dict[str, Any]] = []
+    for index, box in enumerate(boxes):
+        try:
+            class_id = int(class_ids[index]) if class_ids is not None else -1
+            bbox = [round(float(value), 1) for value in box]
+            confidence = (
+                round(float(confidences[index]), 4)
+                if confidences is not None else None
+            )
+            track_id = None
+            if tracker_ids is not None:
+                raw_id = tracker_ids[index]
+                if raw_id is not None:
+                    try:
+                        numeric_id = float(raw_id)
+                        if math.isfinite(numeric_id):
+                            track_id = int(numeric_id)
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+
+            output.append({
+                "class_id": class_id,
+                "class_name": _class_name(names, class_id),
+                "track_id": track_id,
+                "confidence": confidence,
+                "bbox": bbox,
+                "is_person": class_id == 0,
+            })
+        except (TypeError, ValueError, IndexError, OverflowError):
+            logger.debug("Skipping malformed detection at index %s", index)
+    return output
+
+
 # ============================================================
 # 5. MAIN VIDEO PROCESSING FUNCTION
 # ============================================================
@@ -484,6 +533,23 @@ def process_video(
         # INITIALIZE TRACKER
         # ----------------------------------------------------
 
+        _safe_progress_update(
+            update_callback,
+            status="processing",
+            stage="initializing_tracker",
+            activity_message="Video opened. Initializing ByteTrack and frame analytics.",
+            progress=0,
+            current_frame=0,
+            total_frames=total_frames_raw or None,
+            frames_processed=0,
+            current_people=0,
+            current_objects=0,
+            unique_people_so_far=0,
+            elapsed_seconds=round(time.time() - started, 2),
+            current_detections=[],
+            recent_activity=[],
+        )
+
         tracker = create_tracker()
 
         unique_person_ids: set[int] = set()
@@ -579,28 +645,6 @@ def process_video(
 
                 frames_processed += 1
 
-                # ------------------------------------------------
-                # RECENT ACTIVITY
-                # ------------------------------------------------
-
-                recent_activity.append({
-
-                    "frame_number": frame_number,
-
-                    "people_count": current_people,
-
-                    "objects_count": current_objects,
-
-                    "unique_people": len(
-                        unique_person_ids
-                    ),
-
-                })
-
-                recent_activity = (
-                    recent_activity[-20:]
-                )
-
             # ------------------------------------------------
             # ANNOTATE FRAME
             # ------------------------------------------------
@@ -694,68 +738,67 @@ def process_video(
             })
 
             # =================================================
-            # 7. FRONTEND PROGRESS UPDATES
+            # 7. PER-FRAME LIVE TELEMETRY
             # =================================================
 
-            if (
-                frame_number % 5 == 0
-                or frame_number == 1
-            ):
+            detections_payload = _serialize_detections(
+                last_tracked,
+                last_names,
+            )
 
-                progress = (
+            # Record every frame, including frames where inference is
+            # intentionally skipped by frame_interval. For interval > 1,
+            # detections are the latest tracked result carried forward.
+            activity_item = {
+                "frame_number": frame_number,
+                "people_count": current_people,
+                "objects_count": current_objects,
+                "unique_people": len(unique_person_ids),
+                "detection_count": len(detections_payload),
+                "inference_performed": bool(should_infer),
+                "timestamp_seconds": round(timestamp, 3),
+            }
+            recent_activity.append(activity_item)
+            recent_activity = recent_activity[-30:]
 
-                    round(
-                        min(
-                            99.0,
-                            frame_number / total_frames_raw * 100.0,
-                        ),
-                        2,
-                    )
+            progress = (
+                round(min(99.0, frame_number / total_frames_raw * 100.0), 2)
+                if total_frames_raw > 0
+                else 0.0
+            )
 
-                    if total_frames_raw > 0
+            progress_payload = {
+                "status": "processing",
+                "stage": "detecting_and_tracking" if should_infer else "tracking_latest_detections",
+                "activity_message": (
+                    f"Frame {frame_number}: "
+                    f"{current_people} people, {current_objects} objects, "
+                    f"{len(detections_payload)} detections, "
+                    f"{len(unique_person_ids)} unique people tracked."
+                ),
+                "progress": progress,
+                "current_frame": frame_number,
+                "total_frames": total_frames_raw or None,
+                "frames_processed": frames_processed,
+                "current_people": current_people,
+                "current_objects": current_objects,
+                "unique_people_so_far": len(unique_person_ids),
+                "elapsed_seconds": round(time.time() - started, 2),
+                "current_detections": detections_payload,
+                "recent_activity": list(recent_activity),
+            }
 
-                    else 0.0
+            # JPEG preview is relatively large; refresh it every 5 frames
+            # while compact detection telemetry is published on every frame.
+            if frame_number == 1 or frame_number % 5 == 0:
+                progress_payload["latest_frame"] = _frame_preview_data_url(
+                    annotated
                 )
 
-                _safe_progress_update(
-
-                    update_callback,
-
-                    status="processing",
-
-                    progress=progress,
-
-                    current_frame=frame_number,
-
-                    total_frames=(
-                        total_frames_raw or None
-                    ),
-
-                    frames_processed=frames_processed,
-
-                    current_people=current_people,
-
-                    current_objects=current_objects,
-
-                    unique_people_so_far=len(
-                        unique_person_ids
-                    ),
-
-                    elapsed_seconds=round(
-                        time.time() - started,
-                        2,
-                    ),
-
-                    latest_frame=(
-                        _frame_preview_data_url(
-                            annotated
-                        )
-                    ),
-
-                    recent_activity=list(
-                        recent_activity
-                    ),
-                )
+            _safe_progress_update(
+                update_callback,
+                **progress_payload,
+            )
 
         # ====================================================
         # 8. CHECK VIDEO
@@ -766,6 +809,21 @@ def process_video(
             raise ValueError(
                 "The uploaded video contains no readable frames."
             )
+
+        _safe_progress_update(
+            update_callback,
+            status="processing",
+            stage="generating_analytics",
+            activity_message="All video frames processed. Writing CSV and JSON analytics.",
+            progress=99,
+            current_frame=frame_number,
+            total_frames=total_frames_raw or frame_number,
+            frames_processed=frames_processed,
+            current_people=current_people,
+            current_objects=current_objects,
+            unique_people_so_far=len(unique_person_ids),
+            elapsed_seconds=round(time.time() - started, 2),
+        )
 
         # ====================================================
         # 9. SAVE CSV ANALYTICS
@@ -865,3 +923,4 @@ def process_video(
 
         if writer is not None:
             writer.release()
+
