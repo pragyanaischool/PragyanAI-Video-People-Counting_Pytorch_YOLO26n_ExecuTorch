@@ -27,9 +27,9 @@ import AnalyticsDashboard from "./components/AnalyticsDashboard";
 
 import {
   createVideoJob,
-  getJobStatus,
   getJobAnalytics,
-  healthCheck
+  healthCheck,
+  subscribeJobEvents
 } from "./services/api";
 
 
@@ -70,14 +70,15 @@ export default function App() {
 
         if (!active) return;
 
-        if (response.model_files_present) {
-
+        if (!response.backend_connected) {
+          setBackend("offline");
+        } else if (response.model_loaded) {
           setBackend("ready");
-
+        } else if (response.model_files_present) {
+          // Model files exist, but model initialization failed.
+          setBackend("model-error");
         } else {
-
           setBackend("model-missing");
-
         }
 
       } catch (err) {
@@ -189,158 +190,59 @@ export default function App() {
 
 
   // ------------------------------------------------
-  // 3. POLL VIDEO PROCESSING STATUS
+  // 3. LIVE VIDEO PROCESSING UPDATES (SSE)
   // ------------------------------------------------
 
   useEffect(() => {
-
-    if (!job?.job_id) {
-
-      return undefined;
-
-    }
-
-    // Poll only while the job is active
-    if (!["queued", "processing"].includes(job.status)) {
-
-      return undefined;
-
-    }
+    if (!job?.job_id) return undefined;
 
     let active = true;
+    let analyticsLoaded = false;
 
-    let timer = null;
-
-
-    async function pollJobStatus() {
-
-      try {
-
-        const latest = await getJobStatus(job.job_id);
-
+    const stream = subscribeJobEvents(
+      job.job_id,
+      async (latest) => {
         if (!active) return;
 
-        // Update real-time job information
-        setJob(latest);
+        setJob((previous) => ({
+          ...previous,
+          ...latest,
+        }));
 
-        setError("");
-
-        // ------------------------------------------
-        // PROCESSING COMPLETED
-        // ------------------------------------------
-
-        if (latest.status === "completed") {
-
+        if (latest.status === "completed" && !analyticsLoaded) {
+          analyticsLoaded = true;
           try {
-
             const result = await getJobAnalytics(job.job_id);
-
-            if (active) {
-
-              setAnalytics(result.analytics);
-
-            }
-
+            if (active) setAnalytics(result.analytics);
           } catch (analyticsError) {
-
-            console.error(
-              "Analytics retrieval failed:",
-              analyticsError
-            );
-
             if (active) {
-
               setError(
                 `Video completed, but analytics could not be loaded: ${analyticsError.message}`
               );
-
             }
-
           }
-
-          return;
-
         }
-
-
-        // ------------------------------------------
-        // PROCESSING FAILED
-        // ------------------------------------------
 
         if (latest.status === "failed") {
-
-          setError(
-            latest.error || "Video processing failed."
-          );
-
-          return;
-
+          setError(latest.error || "Video processing failed.");
+        } else if (latest.status === "processing" || latest.status === "completed") {
+          setError("");
         }
-
-
-        // ------------------------------------------
-        // PROCESSING CONTINUES
-        // ------------------------------------------
-
-        if (
-          latest.status === "queued" ||
-          latest.status === "processing"
-        ) {
-
-          timer = setTimeout(
-            pollJobStatus,
-            3000
-          );
-
-        }
-
-      } catch (err) {
-
-        console.error(
-          "Job status polling error:",
-          err
-        );
-
+      },
+      (streamError) => {
         if (active) {
-
           setError(
-            `Status check failed: ${err.message}`
+            `${streamError.message} The job may still be running; refresh the page or reconnect to its job stream.`
           );
-
-          // Retry after 5 seconds
-          timer = setTimeout(
-            pollJobStatus,
-            5000
-          );
-
         }
-
       }
-
-    }
-
-
-    // Initial status check
-    timer = setTimeout(
-      pollJobStatus,
-      500
     );
 
-
-    // Cleanup polling timer
     return () => {
-
       active = false;
-
-      if (timer) {
-
-        clearTimeout(timer);
-
-      }
-
+      stream.close();
     };
-
-  }, [job?.job_id, job?.status]);
+  }, [job?.job_id]);
 
 
   // ------------------------------------------------
@@ -353,7 +255,9 @@ export default function App() {
 
     ready: "Backend & model ready",
 
-    "model-missing": "Backend online · Model missing",
+    "model-missing": "Backend online · Model files missing",
+
+    "model-error": "Backend online · Model failed to load",
 
     offline: "Backend unavailable"
 
@@ -733,3 +637,4 @@ export default function App() {
   );
 
 }
+
