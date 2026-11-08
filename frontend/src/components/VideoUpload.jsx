@@ -39,7 +39,7 @@ export default function VideoUpload({ onSubmit, busy }) {
 
   const [confidence, setConfidence] = useState(0.35);
 
-  const [frameInterval, setFrameInterval] = useState(1);
+  const [frameInterval, setFrameInterval] = useState(3);
 
   const [error, setError] = useState("");
 
