@@ -14,6 +14,8 @@ FastAPI job management:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import uuid
 
@@ -27,7 +29,10 @@ from fastapi import (
     Form,
     HTTPException,
     UploadFile,
+    Request,
 )
+from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from config import settings
 
@@ -37,6 +42,8 @@ from services.job_store import (
     create_job,
     get_job,
     update_job,
+    subscribe_job,
+    unsubscribe_job,
 )
 
 from services.video_processor import process_video
@@ -90,6 +97,8 @@ def _run_job(
     update_job(
         job_id,
         status="processing",
+        stage="starting_worker",
+        activity_message="Processing worker started. Preparing video analysis.",
         progress=0,
         error=None,
     )
@@ -134,6 +143,10 @@ def _run_job(
 
             status="completed",
 
+            stage="completed",
+
+            activity_message="Video analysis, tracking and downloadable analytics completed.",
+
             progress=100,
 
             result=result,
@@ -170,6 +183,8 @@ def _run_job(
         update_job(
             job_id,
             status="failed",
+            stage="failed",
+            activity_message=f"Processing failed: {exc}",
             error=str(exc),
         )
 
@@ -380,6 +395,12 @@ async def create_video_job(
 
         "progress": 0,
 
+        "stage": "queued",
+
+        "activity_message": "Video uploaded; waiting for a processing worker.",
+
+        "current_detections": [],
+
         "current_frame": 0,
 
         "total_frames": None,
@@ -454,7 +475,95 @@ async def create_video_job(
 
 
 # ============================================================
-# 4. GET JOB STATUS
+# 4. REAL-TIME JOB EVENTS (SERVER-SENT EVENTS)
+# ============================================================
+
+def _event_payload(job: dict[str, Any]) -> dict[str, Any]:
+    """Expose progress fields only; never send local filesystem paths."""
+    keys = (
+        "job_id",
+        "status",
+        "progress",
+        "stage",
+        "activity_message",
+        "current_frame",
+        "total_frames",
+        "frames_processed",
+        "current_people",
+        "current_objects",
+        "unique_people_so_far",
+        "elapsed_seconds",
+        "latest_frame",
+        "recent_activity",
+        "current_detections",
+        "error",
+        "video_url",
+        "csv_url",
+        "json_url",
+        "analytics",
+        "_version",
+    )
+    return {key: job.get(key) for key in keys if key in job}
+
+
+@router.get("/{job_id}/events")
+async def stream_job_events(job_id: str, request: Request):
+    """
+    Stream progress updates as Server-Sent Events.
+
+    The connection remains open for the full job; there is no per-status
+    request timeout or repeated HTTP polling. The browser reconnects
+    automatically if the network briefly drops.
+    """
+    channel, initial = subscribe_job(job_id)
+    if channel is None or initial is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    async def event_generator():
+        last_preview = object()
+        try:
+            current = initial
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                payload = _event_payload(current)
+                preview = payload.get("latest_frame")
+                if preview == last_preview:
+                    payload.pop("latest_frame", None)
+                else:
+                    last_preview = preview
+                version = int(current.get("_version", 0))
+                yield (
+                    f"id: {version}\n"
+                    f"event: progress\n"
+                    f"data: {json.dumps(payload, separators=(',', ':'), default=str)}\n\n"
+                )
+
+                if current.get("status") in {"completed", "failed", "cancelled"}:
+                    break
+
+                try:
+                    current = await asyncio.to_thread(channel.get, True, 10)
+                except Exception:
+                    # Send an SSE comment heartbeat to keep proxies alive.
+                    yield ": keep-alive\n\n"
+        finally:
+            unsubscribe_job(job_id, channel)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ============================================================
+# 5. GET JOB STATUS (SNAPSHOT / FALLBACK)
 # ============================================================
 
 @router.get(
@@ -533,3 +642,4 @@ def get_video_job_analytics(
 
         "analytics": job.get("analytics"),
     }
+
