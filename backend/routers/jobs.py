@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import uuid
+from threading import Lock
 
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,21 @@ router = APIRouter(
 )
 
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+# This Render web process is configured for one video job at a time.
+_active_jobs_lock = Lock()
+_active_job_ids: set[str] = set()
+
+def _reserve_job_slot(job_id: str) -> bool:
+    with _active_jobs_lock:
+        if len(_active_job_ids) >= max(1, settings.max_concurrent_jobs):
+            return False
+        _active_job_ids.add(job_id)
+        return True
+
+def _release_job_slot(job_id: str) -> None:
+    with _active_jobs_lock:
+        _active_job_ids.discard(job_id)
 
 
 # ============================================================
@@ -205,6 +221,8 @@ def _run_job(
                 input_path,
             )
 
+        _release_job_slot(job_id)
+
 
 # ============================================================
 # 3. CREATE VIDEO PROCESSING JOB
@@ -292,6 +310,15 @@ async def create_video_job(
 
     job_id = uuid.uuid4().hex
 
+    if not _reserve_job_slot(job_id):
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "The video processor is busy. Please wait for the current "
+                "video job to finish before uploading another video."
+            ),
+        )
+
     filename = safe_filename(
         file.filename
     )
@@ -343,6 +370,7 @@ async def create_video_job(
             missing_ok=True
         )
 
+        _release_job_slot(job_id)
         raise
 
     except OSError as exc:
@@ -351,6 +379,7 @@ async def create_video_job(
             missing_ok=True
         )
 
+        _release_job_slot(job_id)
         logger.exception(
             "Could not save uploaded video"
         )
@@ -376,6 +405,7 @@ async def create_video_job(
             missing_ok=True
         )
 
+        _release_job_slot(job_id)
         raise HTTPException(
             status_code=400,
             detail="Uploaded file is empty.",
@@ -642,4 +672,3 @@ def get_video_job_analytics(
 
         "analytics": job.get("analytics"),
     }
-
