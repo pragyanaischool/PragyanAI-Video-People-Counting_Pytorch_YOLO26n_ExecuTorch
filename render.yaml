@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: pragyanai-video-people-counting
+    runtime: python
+    rootDir: backend
+    plan: starter
+    buildCommand: pip install --index-url https://download.pytorch.org/whl/cpu torch==2.9.1 torchvision==0.24.1 && pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.10
+      - key: MODEL_PATH
+        value: models/yolo26n_executorch_model
+      - key: UPLOAD_DIR
+        value: /tmp/pragyanai_uploads
+      - key: OUTPUT_DIR
+        value: /tmp/pragyanai_outputs
+      - key: MAX_UPLOAD_SIZE
+        value: "524288000"
+      - key: DEFAULT_FRAME_INTERVAL
+        value: "1"
+      - key: YOLO_IMAGE_SIZE
+        value: "640"
+      - key: FRONTEND_ORIGIN
+        sync: false
