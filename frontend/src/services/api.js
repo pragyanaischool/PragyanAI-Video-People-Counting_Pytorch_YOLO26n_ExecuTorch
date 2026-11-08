@@ -7,7 +7,7 @@
  * Frontend: React + Vite
  *
  * Configure the backend URL in frontend/.env:
- * VITE_API_BASE_URL=https://YOUR-RENDER-BACKEND.onrender.com
+ * VITE_API_BASE_URL=https://pragyanai-video-people-counting-pytorch.onrender.com
  */
 
 const API_BASE_URL = (
@@ -51,7 +51,8 @@ const apiRequest = async (endpoint, options = {}) => {
       signal: controller.signal,
     });
 
-    const contentType = response.headers.get("content-type") || "";
+    const contentType =
+      response.headers.get("content-type") || "";
 
     let responseData;
 
@@ -89,7 +90,9 @@ const apiRequest = async (endpoint, options = {}) => {
 
     throw error;
   } finally {
-    if (timeout) clearTimeout(timeout);
+    if (timeout) {
+      clearTimeout(timeout);
+    }
   }
 };
 
@@ -97,12 +100,49 @@ const apiRequest = async (endpoint, options = {}) => {
  * 1. Backend Health Check
  *
  * Expected endpoint:
- * GET /api/health
+ * GET /health
+ *
+ * The Render health check uses the root /health route.
  */
 export const healthCheck = async () => {
-  return await apiRequest("/health", {
-    method: "GET",
-  });
+  const controller = new AbortController();
+
+  const timeout = setTimeout(
+    () => controller.abort(),
+    DEFAULT_TIMEOUT
+  );
+
+  try {
+    const response = await fetch(
+      `${API_BASE_URL}/health`,
+      {
+        method: "GET",
+        signal: controller.signal,
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(
+        `Backend health check failed: HTTP ${response.status}`
+      );
+    }
+
+    return await response.json();
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error("Backend health check timed out.");
+    }
+
+    if (error instanceof TypeError) {
+      throw new Error(
+        "Unable to connect to the backend. Please check the API URL and server status."
+      );
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 };
 
 /**
@@ -119,7 +159,7 @@ export const healthCheck = async () => {
 export const createVideoJob = async (
   file,
   confidence = 0.35,
-  frameInterval = 1
+  frameInterval = 3
 ) => {
   if (!file) {
     throw new Error("Please select a video file.");
@@ -135,31 +175,52 @@ export const createVideoJob = async (
     method: "POST",
     body: formData,
 
-    // Upload is the only long HTTP request.
-    // Video analysis runs asynchronously and is monitored
-    // through the EventSource stream.
+    // Upload can take longer than an ordinary API request.
+    // Video processing runs asynchronously in the backend.
+    // Progress is received through SSE.
     timeout: 0,
   });
 };
 
 /**
- * 3. Subscribe to live job updates using Server-Sent Events.
+ * 3. Subscribe to Live Job Updates Using SSE
  *
- * The browser automatically reconnects if the network
+ * The browser automatically reconnects when the network
  * briefly disconnects.
+ *
+ * Parameters:
+ * jobId          - Processing job ID
+ * onUpdate       - Receives job progress snapshots
+ * onClosed       - Called when the connection permanently closes
+ * onReconnecting - Called while EventSource is reconnecting
+ *
+ * Returns:
+ * A cleanup function to close the SSE connection.
  */
 export const subscribeJobEvents = (
   jobId,
   onUpdate,
-  onClosed
+  onClosed,
+  onReconnecting
 ) => {
   if (!jobId) {
     throw new Error("Job ID is required.");
   }
 
   const source = new EventSource(
-    buildUrl(`/jobs/${encodeURIComponent(jobId)}/events`)
+    buildUrl(
+      `/jobs/${encodeURIComponent(jobId)}/events`
+    )
   );
+
+  let intentionallyClosed = false;
+  let statusCheckInProgress = false;
+
+  source.onopen = () => {
+    console.info(
+      "SSE progress connection established."
+    );
+  };
 
   source.addEventListener("progress", (event) => {
     try {
@@ -167,36 +228,90 @@ export const subscribeJobEvents = (
 
       onUpdate?.(payload);
 
+      // Close the connection only after a terminal status.
       if (
         ["completed", "failed", "cancelled"].includes(
           payload.status
         )
       ) {
+        intentionallyClosed = true;
         source.close();
       }
     } catch (error) {
-      console.error("Could not parse live job event:", error);
+      console.error(
+        "Could not parse live job event:",
+        error
+      );
     }
   });
 
-  source.onerror = () => {
-    // CONNECTING means EventSource is retrying automatically.
-    // Report a terminal failure only when the browser closes
-    // the stream.
-    if (source.readyState === EventSource.CLOSED) {
-      onClosed?.(
-        new Error("Live progress connection closed.")
+  source.onerror = async () => {
+    if (intentionallyClosed) {
+      return;
+    }
+
+    if (source.readyState === EventSource.CONNECTING) {
+      console.warn(
+        "SSE disconnected. Browser will reconnect automatically."
       );
+
+      onReconnecting?.();
+
+      return;
+    }
+
+    if (
+      source.readyState === EventSource.CLOSED &&
+      !statusCheckInProgress
+    ) {
+      statusCheckInProgress = true;
+
+      console.error(
+        "SSE connection permanently closed. Checking job status."
+      );
+
+      try {
+        const latest = await getJobStatus(jobId);
+
+        onUpdate?.(latest);
+
+        if (
+          ["completed", "failed", "cancelled"].includes(
+            latest.status
+          )
+        ) {
+          intentionallyClosed = true;
+          return;
+        }
+
+        onClosed?.(
+          new Error(
+            "The live progress stream closed. The job status was checked, but the job may still be active."
+          )
+        );
+      } catch (error) {
+        onClosed?.(error);
+      } finally {
+        statusCheckInProgress = false;
+      }
     }
   };
 
-  return source;
+  // Return cleanup function for React useEffect.
+  return () => {
+    intentionallyClosed = true;
+    source.close();
+
+    console.info(
+      "SSE progress connection closed by frontend."
+    );
+  };
 };
 
 /**
- * 4. Get Video Processing Job Status (snapshot fallback)
+ * 4. Get Video Processing Job Status
  *
- * Expected endpoint:
+ * Snapshot fallback endpoint:
  * GET /api/jobs/{jobId}
  */
 export const getJobStatus = async (jobId) => {
@@ -232,7 +347,7 @@ export const getJobAnalytics = async (jobId) => {
 };
 
 /**
- * 6. Get an output download URL.
+ * 6. Get Download URL
  *
  * Backend routes:
  * GET /api/jobs/{jobId}/video
@@ -275,7 +390,9 @@ export const downloadProcessedVideo = async (
     throw new Error("Job ID is required.");
   }
 
-  const response = await fetch(getDownloadUrl(jobId));
+  const response = await fetch(
+    getDownloadUrl(jobId, "video")
+  );
 
   if (!response.ok) {
     throw new Error(
@@ -285,9 +402,11 @@ export const downloadProcessedVideo = async (
 
   const blob = await response.blob();
 
-  const objectUrl = window.URL.createObjectURL(blob);
+  const objectUrl =
+    window.URL.createObjectURL(blob);
 
   const link = document.createElement("a");
+
   link.href = objectUrl;
   link.download = filename;
 
@@ -313,7 +432,7 @@ export const getModelInfo = async () => {
 /**
  * 9. Cancel a Processing Job
  *
- * Optional endpoint:
+ * Optional backend endpoint:
  * DELETE /api/jobs/{jobId}
  *
  * Implement this route in FastAPI before using this function.
