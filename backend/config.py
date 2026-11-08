@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     )
 
     # YOLO26n ExecuTorch model directory
-    model_path: str = "models"
+    model_path: str = "models/yolo26n_executorch_model"
 
     # Frontend URL
     frontend_origin: str = (
@@ -36,13 +36,16 @@ class Settings(BaseSettings):
     max_upload_size: int = 524_288_000
 
     # Process every Nth frame
-    default_frame_interval: int = 1
+    default_frame_interval: int = 3
 
     # YOLO input image size
-    yolo_image_size: int = 640
+    yolo_image_size: int = 416
 
     # Detection confidence threshold
     default_confidence: float = 0.35
+
+    # Limit this single-process deployment to one active video job.
+    max_concurrent_jobs: int = 1
 
     @property
     def backend_dir(self) -> Path:
@@ -95,3 +98,4 @@ class Settings(BaseSettings):
 settings = Settings()
 
 settings.create_storage_directories()
+
