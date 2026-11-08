@@ -232,15 +232,20 @@ export default function App() {
       (streamError) => {
         if (active) {
           setError(
-            `${streamError.message} The job may still be running; refresh the page or reconnect to its job stream.`
+            `${streamError.message} Check the backend logs and job status before starting another upload.`
           );
+        }
+      },
+      () => {
+        if (active) {
+          setError("Connection interrupted. Reconnecting to live progress...");
         }
       }
     );
 
     return () => {
       active = false;
-      stream.close();
+      stream();
     };
   }, [job?.job_id]);
 
@@ -637,4 +642,5 @@ export default function App() {
   );
 
 }
+
 
