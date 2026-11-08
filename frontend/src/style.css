@@ -121,3 +121,51 @@ footer { display: flex; justify-content: space-between; padding: 28px 2px 0; mar
   .summary-grid { grid-template-columns: 1fr; }
   footer { gap: 12px; flex-direction: column; }
 }
+
+
+/* Live SSE telemetry */
+.live-stage {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border, #dbe2ea);
+  border-radius: 12px;
+  background: var(--surface-muted, rgba(120, 130, 150, 0.07));
+}
+.live-stage b {
+  display: block;
+  margin-bottom: 5px;
+  text-transform: capitalize;
+}
+.live-stage p {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+.detection-live {
+  margin-top: 18px;
+}
+.detection-list {
+  display: grid;
+  gap: 6px;
+  max-height: 260px;
+  overflow: auto;
+}
+.detection-row {
+  display: grid;
+  grid-template-columns: minmax(90px, 1.2fr) 0.8fr 0.7fr 0.6fr;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--border, #dbe2ea);
+  border-radius: 8px;
+  font-size: 0.82rem;
+}
+.detection-row span {
+  color: var(--muted, #667085);
+}
+@media (max-width: 600px) {
+  .detection-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
