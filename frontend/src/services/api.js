@@ -16,7 +16,7 @@ const API_BASE_URL = (
 
 const API_PREFIX = "/api";
 
-const DEFAULT_TIMEOUT = 30000;
+const DEFAULT_TIMEOUT = 15000;
 
 /**
  * Build API endpoint URL.
@@ -35,9 +35,15 @@ const buildUrl = (endpoint) => {
 const apiRequest = async (endpoint, options = {}) => {
   const controller = new AbortController();
 
-  const timeout = setTimeout(() => {
-    controller.abort();
-  }, options.timeout || DEFAULT_TIMEOUT);
+  const timeoutMs =
+    options.timeout === 0
+      ? 0
+      : (options.timeout ?? DEFAULT_TIMEOUT);
+
+  const timeout =
+    timeoutMs > 0
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : null;
 
   try {
     const response = await fetch(buildUrl(endpoint), {
@@ -83,7 +89,7 @@ const apiRequest = async (endpoint, options = {}) => {
 
     throw error;
   } finally {
-    clearTimeout(timeout);
+    if (timeout) clearTimeout(timeout);
   }
 };
 
@@ -92,9 +98,6 @@ const apiRequest = async (endpoint, options = {}) => {
  *
  * Expected endpoint:
  * GET /api/health
- *
- * Adjust this endpoint if your backend health router
- * exposes a different route.
  */
 export const healthCheck = async () => {
   return await apiRequest("/health", {
@@ -131,12 +134,67 @@ export const createVideoJob = async (
   return await apiRequest("/jobs", {
     method: "POST",
     body: formData,
-    timeout: 120000,
+
+    // Upload is the only long HTTP request.
+    // Video analysis runs asynchronously and is monitored
+    // through the EventSource stream.
+    timeout: 0,
   });
 };
 
 /**
- * 3. Get Video Processing Job Status
+ * 3. Subscribe to live job updates using Server-Sent Events.
+ *
+ * The browser automatically reconnects if the network
+ * briefly disconnects.
+ */
+export const subscribeJobEvents = (
+  jobId,
+  onUpdate,
+  onClosed
+) => {
+  if (!jobId) {
+    throw new Error("Job ID is required.");
+  }
+
+  const source = new EventSource(
+    buildUrl(`/jobs/${encodeURIComponent(jobId)}/events`)
+  );
+
+  source.addEventListener("progress", (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+
+      onUpdate?.(payload);
+
+      if (
+        ["completed", "failed", "cancelled"].includes(
+          payload.status
+        )
+      ) {
+        source.close();
+      }
+    } catch (error) {
+      console.error("Could not parse live job event:", error);
+    }
+  });
+
+  source.onerror = () => {
+    // CONNECTING means EventSource is retrying automatically.
+    // Report a terminal failure only when the browser closes
+    // the stream.
+    if (source.readyState === EventSource.CLOSED) {
+      onClosed?.(
+        new Error("Live progress connection closed.")
+      );
+    }
+  };
+
+  return source;
+};
+
+/**
+ * 4. Get Video Processing Job Status (snapshot fallback)
  *
  * Expected endpoint:
  * GET /api/jobs/{jobId}
@@ -146,13 +204,16 @@ export const getJobStatus = async (jobId) => {
     throw new Error("Job ID is required.");
   }
 
-  return await apiRequest(`/jobs/${encodeURIComponent(jobId)}`, {
-    method: "GET",
-  });
+  return await apiRequest(
+    `/jobs/${encodeURIComponent(jobId)}`,
+    {
+      method: "GET",
+    }
+  );
 };
 
 /**
- * 4. Get Job Analytics
+ * 5. Get Job Analytics
  *
  * Expected endpoint:
  * GET /api/jobs/{jobId}/analytics
@@ -171,23 +232,40 @@ export const getJobAnalytics = async (jobId) => {
 };
 
 /**
- * 5. Get Processed Video Download URL
+ * 6. Get an output download URL.
  *
- * Expected endpoint:
- * GET /api/downloads/{jobId}
- *
- * Returns a URL that can be used by the browser.
+ * Backend routes:
+ * GET /api/jobs/{jobId}/video
+ * GET /api/jobs/{jobId}/csv
+ * GET /api/jobs/{jobId}/json
  */
-export const getDownloadUrl = (jobId) => {
+export const getDownloadUrl = (
+  jobId,
+  outputType = "video"
+) => {
   if (!jobId) {
     throw new Error("Job ID is required.");
   }
 
-  return buildUrl(`/downloads/${encodeURIComponent(jobId)}`);
+  const allowedTypes = new Set([
+    "video",
+    "csv",
+    "json",
+  ]);
+
+  if (!allowedTypes.has(outputType)) {
+    throw new Error(
+      `Unsupported output type: ${outputType}. Use video, csv or json.`
+    );
+  }
+
+  return buildUrl(
+    `/jobs/${encodeURIComponent(jobId)}/${outputType}`
+  );
 };
 
 /**
- * 6. Download Processed Video
+ * 7. Download Processed Video
  */
 export const downloadProcessedVideo = async (
   jobId,
@@ -200,10 +278,13 @@ export const downloadProcessedVideo = async (
   const response = await fetch(getDownloadUrl(jobId));
 
   if (!response.ok) {
-    throw new Error("Unable to download the processed video.");
+    throw new Error(
+      "Unable to download the processed video."
+    );
   }
 
   const blob = await response.blob();
+
   const objectUrl = window.URL.createObjectURL(blob);
 
   const link = document.createElement("a");
@@ -218,12 +299,10 @@ export const downloadProcessedVideo = async (
 };
 
 /**
- * 7. Get Backend Model Information
+ * 8. Get Backend Model Information
  *
  * Expected endpoint:
  * GET /api/model-info
- *
- * Adjust this route if your backend uses another endpoint.
  */
 export const getModelInfo = async () => {
   return await apiRequest("/model-info", {
@@ -232,7 +311,7 @@ export const getModelInfo = async () => {
 };
 
 /**
- * 8. Cancel a Processing Job
+ * 9. Cancel a Processing Job
  *
  * Optional endpoint:
  * DELETE /api/jobs/{jobId}
@@ -244,22 +323,26 @@ export const cancelVideoJob = async (jobId) => {
     throw new Error("Job ID is required.");
   }
 
-  return await apiRequest(`/jobs/${encodeURIComponent(jobId)}`, {
-    method: "DELETE",
-  });
+  return await apiRequest(
+    `/jobs/${encodeURIComponent(jobId)}`,
+    {
+      method: "DELETE",
+    }
+  );
 };
 
 /**
- * 9. Get API Base URL
+ * 10. Get API Base URL
  */
 export const getApiBaseUrl = () => API_BASE_URL;
 
 /**
- * 10. Default API Service
+ * 11. Default API Service
  */
 const api = {
   healthCheck,
   createVideoJob,
+  subscribeJobEvents,
   getJobStatus,
   getJobAnalytics,
   getDownloadUrl,
